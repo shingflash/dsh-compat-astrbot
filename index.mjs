@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 /**
- * index.mjs —— dsh 端宿主：把 AstrBot（Python）插件拉起来，走 stdio JSON-lines。
+ * index.mjs - host side for dsh: load AstrBot (Python) plugins over stdio
+ * JSON-lines.
  *
- * 用法：
- *   node index.mjs --plugin <插件目录> --probe
+ * Usage:
+ *   node index.mjs --plugin <plugin dir> --probe
  *   node index.mjs --plugin <dir> --config <cfg.json> --rpc
  *
- * 协议与 star_host.py 一致；stdout 只留协议帧，日志全部走 stderr。
+ * Protocol matches py/star_host.py; stdout carries frames only, logs go to stderr.
  */
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { existsSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
@@ -31,27 +32,49 @@ const rpc = has('--rpc')
 const debug = has('--debug')
 
 if (!pluginDir) {
-  console.error('缺 --plugin <插件目录>')
+  console.error('missing --plugin <plugin directory>')
   process.exit(2)
 }
 if (!existsSync(pluginDir) || !statSync(pluginDir).isDirectory()) {
-  console.error('插件目录不存在：' + pluginDir)
+  console.error('plugin directory not found: ' + pluginDir)
   process.exit(2)
 }
 if (!existsSync(HOST_PY)) {
-  console.error('宿主脚本缺失：' + HOST_PY)
+  console.error('host script missing: ' + HOST_PY)
   process.exit(2)
 }
 
-const python = arg('--python') || process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
-const pyArgs = [HOST_PY, '--plugin', resolve(pluginDir)]
+/** Pick a usable Python interpreter: explicit flag, PYTHON env, py -3, python3, python. */
+function pickPython() {
+  const explicit = arg('--python')
+  if (explicit) return { cmd: explicit, args: [] }
+  if (process.env.PYTHON) return { cmd: process.env.PYTHON, args: [] }
+  const candidates = process.platform === 'win32'
+    ? [['py', ['-3']], ['python', []], ['python3', []]]
+    : [['python3', []], ['python', []]]
+  for (const [cmd, args] of candidates) {
+    const r = spawnSync(cmd, [...args, '--version'], { encoding: 'utf8', timeout: 8000 })
+    if (r.status === 0 && /^Python 3\./m.test((r.stdout || '') + (r.stderr || ''))) {
+      return { cmd, args }
+    }
+  }
+  return null
+}
+
+const py = pickPython()
+if (!py) {
+  console.error('no usable Python 3 found; pass --python <path> or set PYTHON')
+  process.exit(2)
+}
+if (debug) process.stderr.write(`[index] python = ${py.cmd} ${py.args.join(' ')}\n`)
+
+const pyArgs = [...py.args, HOST_PY, '--plugin', resolve(pluginDir)]
 if (configPath) pyArgs.push('--config', resolve(configPath))
 
-const child = spawn(python, pyArgs, { stdio: ['pipe', 'pipe', 'pipe'] })
+const child = spawn(py.cmd, pyArgs, { stdio: ['pipe', 'pipe', 'pipe'] })
 
 child.stderr.on('data', (b) => {
-  const s = b.toString()
-  if (debug) process.stderr.write(s)
+  if (debug) process.stderr.write(b.toString())
 })
 
 const rl = createInterface({ input: child.stdout })
@@ -90,7 +113,7 @@ rl.on('line', (line) => {
     }
     return
   }
-  if (msg.event === 'fatal') return fail(msg.error || '未知致命错误')
+  if (msg.event === 'fatal') return fail(msg.error || 'unknown fatal error')
   const id = msg.id
   const w = waiters.get(id)
   if (!w) return
@@ -100,8 +123,8 @@ rl.on('line', (line) => {
 })
 
 child.on('exit', (code) => {
-  if (rpc && !ready) fail(`star_host 退出，code=${code}`)
-  for (const [, w] of waiters) w.reject(new Error(`star_host 已退出 code=${code}`))
+  if (rpc && !ready) fail(`star_host exited with code ${code}`)
+  for (const [, w] of waiters) w.reject(new Error(`star_host exited with code ${code}`))
   waiters.clear()
   process.exit(code ?? 0)
 })
@@ -114,7 +137,7 @@ function call(method, params = {}, timeout = 120000) {
     setTimeout(() => {
       if (waiters.has(id)) {
         waiters.delete(id)
-        rejectP(new Error(`调用超时：${method}`))
+        rejectP(new Error(`call timed out: ${method}`))
       }
     }, timeout).unref()
   })

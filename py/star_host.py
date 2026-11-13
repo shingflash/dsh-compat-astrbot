@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""star_host.py —— 用假 AstrBot API 把一个 AstrBot 插件拉起来，走 stdio JSON-lines。
+"""star_host.py - load an AstrBot (Python) plugin behind a fake AstrBot API and
+speak stdio JSON-lines.
 
-这不是 AstrBot 本体，只实现插件最常用的那一层：
+This is not AstrBot itself; it only implements the layer plugins usually touch:
   astrbot.api.logger / event(AstrMessageEvent, filter) / star(Context, Star, register)
   astrbot.api.provider.ProviderRequest / message_components
 
-协议（一行一个 JSON）：
-  请求  {"id":1,"method":"list"}
-        {"id":2,"method":"command","params":{"name":"自迭代","text":"详细"}}
-        {"id":3,"method":"tool","params":{"name":"t","args":{}}}
-  响应  {"id":1,"result":{...}} / {"id":1,"error":"..."}
-  主动  {"event":"ready","plugin":"...","commands":[...],"tools":[...],"hooks":[...]}
+Protocol (one JSON per line):
+  request   {"id":1,"method":"list"}
+            {"id":2,"method":"command","params":{"name":"selfdrive","text":"detail"}}
+            {"id":3,"method":"tool","params":{"name":"t","args":{}}}
+  response  {"id":1,"result":{...}} / {"id":1,"error":"..."}
+  event     {"event":"ready","plugin":"...","commands":[...],"tools":[...],"hooks":[...]}
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ LOG = logging.getLogger("star_host")
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="[%(levelname)s] %(message)s")
 
-# ---------------------------------------------------------------- 假 AstrBot
+# ---------------------------------------------------------------- fake AstrBot
 
 
 class MessageResult:
@@ -87,7 +88,7 @@ class Star:
 
 
 class _Filter:
-    """把装饰器信息记在函数属性上，宿主扫描时取。"""
+    """Record decorator metadata as function attributes; the host scans them."""
 
     def command(self, name: str | None = None):
         def deco(fn):
@@ -167,17 +168,17 @@ def _install_fake_astrbot() -> None:
         sys.modules[mod.__name__] = mod
 
 
-# ---------------------------------------------------------------- 加载与调用
+# ---------------------------------------------------------------- load & call
 
 
 def load_plugin(plugin_dir: str, config: dict) -> Star:
     main_py = Path(plugin_dir) / "main.py"
     if not main_py.exists():
-        raise FileNotFoundError(f"找不到 {main_py}")
+        raise FileNotFoundError(f"main.py not found: {main_py}")
     _install_fake_astrbot()
     spec = importlib.util.spec_from_file_location("astrbot_plugin_under_test", str(main_py))
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"加载不了 {main_py}")
+        raise RuntimeError(f"cannot load {main_py}")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["astrbot_plugin_under_test"] = mod
     sys.path.insert(0, str(Path(plugin_dir)))
@@ -187,10 +188,12 @@ def load_plugin(plugin_dir: str, config: dict) -> Star:
     for _, obj in vars(mod).items():
         if inspect.isclass(obj) and issubclass(obj, Star) and obj is not Star:
             try:
-                return obj(ctx, config) if "config" in inspect.signature(obj.__init__).parameters else obj(ctx)
+                if "config" in inspect.signature(obj.__init__).parameters:
+                    return obj(ctx, config)
+                return obj(ctx)
             except TypeError:
                 return obj(ctx)
-    raise RuntimeError("插件的 main.py 里没有 Star 子类")
+    raise RuntimeError("main.py defines no Star subclass")
 
 
 def collect(inst: Star) -> dict:
@@ -260,7 +263,7 @@ async def call_hook(inst: Star, attr: str, text: str, system_prompt: str) -> str
     return req.system_prompt
 
 
-# ---------------------------------------------------------------- stdio 主循环
+# ---------------------------------------------------------------- stdio loop
 
 
 def write_frame(obj: dict) -> None:
@@ -274,7 +277,7 @@ async def main_async(args) -> int:
         try:
             cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
         except Exception as e:
-            write_frame({"event": "fatal", "error": f"配置读不了: {e}"})
+            write_frame({"event": "fatal", "error": f"cannot read config: {e}"})
             return 2
     try:
         inst = load_plugin(args.plugin, cfg)
@@ -307,26 +310,26 @@ async def main_async(args) -> int:
             elif method == "command":
                 target = next((c for c in info["commands"] if c["name"] == params.get("name")), None)
                 if not target:
-                    raise KeyError(f"没有命令 {params.get('name')}")
+                    raise KeyError(f"no such command: {params.get('name')}")
                 result = await call_command(inst, target["attr"], params.get("text", ""),
                                             bool(params.get("admin")))
             elif method == "tool":
                 target = next((t for t in info["tools"] if t["name"] == params.get("name")), None)
                 if not target:
-                    raise KeyError(f"没有工具 {params.get('name')}")
+                    raise KeyError(f"no such tool: {params.get('name')}")
                 result = await call_tool(inst, target["attr"], params.get("name"),
                                          params.get("args") or {})
             elif method == "hook":
                 target = info["hooks"][0] if info["hooks"] else None
                 if not target:
-                    raise KeyError("插件没有 on_llm_request")
+                    raise KeyError("plugin defines no on_llm_request")
                 result = await call_hook(inst, target["attr"], params.get("text", ""),
                                          params.get("system_prompt", ""))
             elif method == "shutdown":
                 write_frame({"id": rid, "result": True})
                 break
             else:
-                raise KeyError(f"未知方法 {method}")
+                raise KeyError(f"unknown method: {method}")
             write_frame({"id": rid, "result": result})
         except Exception as e:
             write_frame({"id": rid, "error": f"{type(e).__name__}: {e}"})

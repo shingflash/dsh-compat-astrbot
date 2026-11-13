@@ -1,9 +1,9 @@
 {
   "name": "dsh-compat-astrbot",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
-  "description": "在 dsh / Node 侧加载 AstrBot（Python）插件的兼容宿主",
+  "description": "Host that loads AstrBot (Python) plugins inside dsh / Node",
   "bin": {
     "dsh-compat-astrbot": "index.mjs"
   },
