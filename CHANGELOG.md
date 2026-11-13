@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## Unreleased
+
+- README rewritten as bilingual (English + 中文) with badges and a sectioned layout
+
 ## 1.0.2
 
 - All in-code instruction text switched to English (comments, errors, protocol
