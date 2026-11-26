@@ -83,14 +83,78 @@ class Context:
 
 
 class Star:
-    def __init__(self, context: Context | None = None):
-        self.context = context or Context()
+    def __init__(self, context: Context | None = None, config: dict | None = None):
+        self.context = context or Context(config)
+
+    def __getattr__(self, name: str):
+        """AstrBot's Star base class ships helpers we do not emulate
+        (html_render, text_to_image, ...). Degrade to an async no-op instead of
+        crashing the plugin the first time it calls one."""
+        if name.startswith("__"):
+            raise AttributeError(name)
+        LOG.debug("Star.%s is not emulated; returning an async no-op", name)
+
+        async def _noop(*_a, **_k):
+            return ""
+        return _noop
+
+
+class _Decorator:
+    """The result of calling an unmodelled filter: applying it is a no-op."""
+
+    def __call__(self, fn, *_a, **_k):
+        return fn
+
+
+class _Permissive:
+    """Stand-in for an unmodelled AstrBot enum member or filter.
+
+    `filter.PRIVATE_MESSAGE`, `filter.EventMessageType.PRIVATE_MESSAGE` and
+    `@filter.permission_type(...)` all have to work from the same object.
+    """
+
+    def __getattr__(self, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return self
+
+    def __getitem__(self, _item):
+        return self
+
+    def __or__(self, _other):
+        return self
+
+    def __ror__(self, _other):
+        return self
+
+    def __call__(self, *_a, **_k):
+        return _Decorator()
+
+
+class _CommandGroup:
+    """What @filter.command_group returns in AstrBot: members are declared with
+    @group.command("sub"). Commands surface as "<group> <sub>"."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def command(self, name: str | None = None):
+        def deco(fn):
+            fn.__astrbot_command__ = f"{self.name} {name or fn.__name__}"
+            return fn
+        return deco
+
+    def group(self, name: str | None = None):
+        return _CommandGroup(f"{self.name} {name or ''}".strip())
+
+    def __call__(self, *a, **k):
+        return None
 
 
 class _Filter:
     """Record decorator metadata as function attributes; the host scans them."""
 
-    def command(self, name: str | None = None):
+    def command(self, name: str | None = None, alias=None, **_kw):
         def deco(fn):
             fn.__astrbot_command__ = name or fn.__name__
             return fn
@@ -108,10 +172,25 @@ class _Filter:
             return fn
         return deco
 
+    def command_group(self, name: str | None = None):
+        def deco(fn):
+            group = _CommandGroup(name or fn.__name__)
+            return group
+        return deco
+
     def event_message_type(self, *a, **kw):
         def deco(fn):
             return fn
         return deco
+
+    def __getattr__(self, name: str):
+        """Any filter we do not model (regex, permission_type, on_decorating_result,
+        after_message_sent, PRIVATE_MESSAGE, ...) must degrade to a no-op, not blow
+        up the whole plugin at import time."""
+        if name.startswith("__"):
+            raise AttributeError(name)
+        LOG.debug("filter.%s is not emulated; using a permissive stub", name)
+        return _Permissive()
 
 
 filter = _Filter()
@@ -134,41 +213,193 @@ class Plain:
         return self.text
 
 
+class MessageEventResult(list):
+    """Stand-in for astrbot.api.event.MessageEventResult: a component chain that
+    real plugins build with .message() / append and return from a handler."""
+
+    def __init__(self, chain: list | None = None):
+        super().__init__(chain or [])
+        self.message_str = ""
+
+    def message(self, text: str):
+        self.message_str = str(text)
+        return self
+
+    def use_t2i(self, _flag: bool = True):
+        return self
+
+    def __str__(self) -> str:
+        if self.message_str:
+            return self.message_str
+        return "\n".join(str(c) for c in self)
+
+
+class _StubModule(types.ModuleType):
+    """Forgiving module: an unknown attribute becomes a permissive class.
+
+    The hook has to live in the module dict (PEP 562); a `__getattr__` defined on
+    the ModuleType subclass is never consulted by CPython.
+    """
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.__path__ = []
+        self.__dict__["__getattr__"] = self._auto
+
+    def _auto(self, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        # a real (fake) submodule may already be registered: hand that back instead
+        # of shadowing it with a stub class.
+        mod = sys.modules.get(f"{self.__name__}.{name}")
+        if mod is not None:
+            setattr(self, name, mod)
+            return mod
+        LOG.debug("astrbot stub: %s.%s auto-created", self.__name__, name)
+
+        def _init(_self, *a, **k):
+            _self.args, _self.kwargs = a, k
+
+        def _getattr(_self, item):
+            raise AttributeError(item)
+
+        class _StubMeta(type):
+            # StarTools.get_data_dir(...) and friends: class-level use must not crash
+            def __getattr__(cls, item):
+                def _noop(*_a, **_k):
+                    return None
+                return _noop
+
+        stub = _StubMeta(name, (), {"__init__": _init, "__getattr__": _getattr})
+        setattr(self, name, stub)
+        return stub
+
+
+class _StubLoader:
+    def create_module(self, spec):
+        mod = _StubModule(spec.name)
+        mod.__path__ = []
+        return mod
+
+    def exec_module(self, module):
+        pass
+
+
+class _AstrbotStubFinder:
+    """Last-resort: astrbot.core.* / astrbot.api.* paths we did not model still
+    import, so a plugin fails only on the feature it actually uses."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "astrbot" or fullname.startswith("astrbot."):
+            import importlib.machinery
+            return importlib.machinery.ModuleSpec(fullname, _StubLoader(), is_package=True)
+        return None
+
+
 def _install_fake_astrbot() -> None:
-    api = types.ModuleType("astrbot.api")
+    api = _StubModule("astrbot.api")
     api.logger = LOG
     api.StarTools = StarTools
 
-    ev = types.ModuleType("astrbot.api.event")
+    ev = _StubModule("astrbot.api.event")
     ev.AstrMessageEvent = AstrMessageEvent
+    ev.MessageEventResult = MessageEventResult
     ev.filter = filter
 
-    star = types.ModuleType("astrbot.api.star")
+    star = _StubModule("astrbot.api.star")
     star.Context = Context
     star.Star = Star
     star.StarTools = StarTools
 
-    def register(name, author="", desc="", version=""):
+    def register(name, author="", desc="", version="", *args, **extra):
         def deco(cls):
             cls.__astrbot_meta__ = {"name": name, "author": author,
-                                    "desc": desc, "version": version}
+                                    "desc": desc, "version": version,
+                                    **{k: v for k, v in extra.items()}}
             return cls
         return deco
     star.register = register
 
-    prov = types.ModuleType("astrbot.api.provider")
+    prov = _StubModule("astrbot.api.provider")
     prov.ProviderRequest = ProviderRequest
 
-    comp = types.ModuleType("astrbot.api.message_components")
+    comp = _StubModule("astrbot.api.message_components")
     comp.Plain = Plain
 
-    astrbot = types.ModuleType("astrbot")
+    astrbot = _StubModule("astrbot")
     astrbot.api = api
-    for mod in (astrbot, api, ev, star, prov, comp):
+    api.event, api.star, api.provider, api.message_components = ev, star, prov, comp
+
+    # astrbot.api.all re-exports the public surface; `from astrbot.api.all import *`
+    # is the most common import line in real plugins.
+    allmod = _StubModule("astrbot.api.all")
+    exported = {
+        "AstrMessageEvent": AstrMessageEvent,
+        "MessageEventResult": MessageEventResult,
+        "filter": filter,
+        "logger": LOG,
+        "Plain": Plain,
+        "ProviderRequest": ProviderRequest,
+        "Context": Context,
+        "Star": Star,
+        "StarTools": StarTools,
+        "register": register,
+    }
+    for k, v in exported.items():
+        setattr(allmod, k, v)
+    extra = ["BaseMessageComponent", "MessageChain", "At", "AtAll", "Image", "Reply",
+             "Record", "Video", "File", "EventMessageType", "PermissionType",
+             "MessageType", "Provider", "LLMResponse", "FunctionTool", "AstrBotConfig",
+             "TextPart", "ImagePart", "ToolSet"]
+    for name in extra:
+        getattr(allmod, name)            # auto-creates the permissive stub class
+    allmod.__all__ = list(exported) + extra
+    api.all = allmod
+
+    for mod in (astrbot, api, ev, star, prov, comp, allmod):
+        mod.__path__ = []          # make them packages, else astrbot.core fails
         sys.modules[mod.__name__] = mod
+    if not any(isinstance(f, _AstrbotStubFinder) for f in sys.meta_path):
+        sys.meta_path.append(_AstrbotStubFinder())
 
 
 # ---------------------------------------------------------------- load & call
+
+
+def _seed_star_imports(allmod, plugin_dir: Path) -> None:
+    """`from astrbot.api.all import *` copies the module dict, so any name the
+    plugin expects but we do not export becomes a NameError at import time.
+    Read the plugin's own AST and pre-create the missing Capitalized names."""
+    import ast
+
+    wanted: set[str] = set()
+    for py in plugin_dir.rglob("*.py"):
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        star = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.ImportFrom) and not n.level and n.module
+            and n.module.startswith("astrbot") and any(a.name == "*" for a in n.names)
+        ]
+        if not star:
+            continue
+        bound = {n.name for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        bound |= {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                  for t in n.targets if isinstance(t, ast.Name)}
+        bound |= {a.asname or a.name for n in ast.walk(tree)
+                  if isinstance(n, (ast.Import, ast.ImportFrom))
+                  for a in n.names if a.name != "*"}
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+                    and n.id not in bound and n.id[:1].isupper()):
+                wanted.add(n.id)
+    for name in wanted:
+        if name not in allmod.__dict__:
+            getattr(allmod, name)       # permissive stub class, via _StubModule
+    allmod.__all__ = [k for k in allmod.__dict__ if not k.startswith("_")]
 
 
 def load_plugin(plugin_dir: str, config: dict) -> Star:
@@ -176,12 +407,21 @@ def load_plugin(plugin_dir: str, config: dict) -> Star:
     if not main_py.exists():
         raise FileNotFoundError(f"main.py not found: {main_py}")
     _install_fake_astrbot()
-    spec = importlib.util.spec_from_file_location("astrbot_plugin_under_test", str(main_py))
+    try:
+        _seed_star_imports(sys.modules["astrbot.api.all"], Path(plugin_dir))
+    except Exception as e:              # never block loading over a seeding miss
+        LOG.debug("star-import seeding skipped: %s", e)
+    # Load main.py as a package so relative imports ("from .utils import x")
+    # resolve; they are extremely common in real AstrBot plugins.
+    pkg = "astrbot_plugin_under_test"
+    spec = importlib.util.spec_from_file_location(
+        pkg, str(main_py), submodule_search_locations=[str(Path(plugin_dir).resolve())])
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {main_py}")
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["astrbot_plugin_under_test"] = mod
-    sys.path.insert(0, str(Path(plugin_dir)))
+    if str(Path(plugin_dir).resolve()) not in sys.path:
+        sys.path.insert(0, str(Path(plugin_dir).resolve()))
+    sys.modules[pkg] = mod
     spec.loader.exec_module(mod)
 
     ctx = Context(config)
@@ -198,10 +438,12 @@ def load_plugin(plugin_dir: str, config: dict) -> Star:
 
 def collect(inst: Star) -> dict:
     commands, tools, hooks = [], [], []
+    seen: set[str] = set()
     for cls in type(inst).__mro__:
         for attr, fn in vars(cls).items():
-            if not callable(fn):
+            if attr in seen or not callable(fn):
                 continue
+            seen.add(attr)
             if hasattr(fn, "__astrbot_command__"):
                 commands.append({"name": fn.__astrbot_command__, "attr": attr})
             if hasattr(fn, "__astrbot_tool__"):
@@ -227,10 +469,10 @@ async def _consume(ret):
 def _to_text(ret) -> str:
     if ret is None:
         return ""
+    if isinstance(ret, (MessageResult, MessageEventResult)):
+        return str(ret)
     if isinstance(ret, (list, tuple)):
         return "\n".join(_to_text(x) for x in ret if x is not None)
-    if isinstance(ret, MessageResult):
-        return ret.text
     return str(ret)
 
 
@@ -320,11 +562,11 @@ async def main_async(args) -> int:
                 result = await call_tool(inst, target["attr"], params.get("name"),
                                          params.get("args") or {})
             elif method == "hook":
-                target = info["hooks"][0] if info["hooks"] else None
-                if not target:
+                if not info["hooks"]:
                     raise KeyError("plugin defines no on_llm_request")
-                result = await call_hook(inst, target["attr"], params.get("text", ""),
-                                         params.get("system_prompt", ""))
+                result = params.get("system_prompt", "")
+                for hook in info["hooks"]:
+                    result = await call_hook(inst, hook["attr"], params.get("text", ""), result)
             elif method == "shutdown":
                 write_frame({"id": rid, "result": True})
                 break
