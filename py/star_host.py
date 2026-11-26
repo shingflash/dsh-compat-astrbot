@@ -23,6 +23,7 @@ import json
 import logging
 import sys
 import types
+from dataclasses import dataclass, field
 from pathlib import Path
 
 LOG = logging.getLogger("star_host")
@@ -75,11 +76,35 @@ class Context:
         self.config = config or {}
         self._llm_tools: list = []
 
+    def __getattr__(self, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        LOG.debug("Context.%s is not emulated; returning a permissive no-op", name)
+        return _AnyCallable()
+
     def add_llm_tools(self, *tools) -> None:
         self._llm_tools.extend(tools)
 
     def get_config(self) -> dict:
         return self.config
+
+
+class _AnyCallable:
+    """Callable, awaitable and attribute-permissive: plugins use unknown Star
+    helpers as `await self.x(...)`, `self.x.y(...)` and `self.x.y.z` alike."""
+
+    def __getattr__(self, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return self
+
+    def __call__(self, *_a, **_k):
+        return self
+
+    def __await__(self):
+        async def _result():
+            return ""
+        return _result().__await__()
 
 
 class Star:
@@ -92,11 +117,8 @@ class Star:
         crashing the plugin the first time it calls one."""
         if name.startswith("__"):
             raise AttributeError(name)
-        LOG.debug("Star.%s is not emulated; returning an async no-op", name)
-
-        async def _noop(*_a, **_k):
-            return ""
-        return _noop
+        LOG.debug("Star.%s is not emulated; returning a permissive no-op", name)
+        return _AnyCallable()
 
 
 class _Decorator:
@@ -138,7 +160,7 @@ class _CommandGroup:
     def __init__(self, name: str):
         self.name = name
 
-    def command(self, name: str | None = None):
+    def command(self, name: str | None = None, **_kw):
         def deco(fn):
             fn.__astrbot_command__ = f"{self.name} {name or fn.__name__}"
             return fn
@@ -160,13 +182,13 @@ class _Filter:
             return fn
         return deco
 
-    def llm_tool(self, name: str | None = None):
+    def llm_tool(self, name: str | None = None, **_kw):
         def deco(fn):
             fn.__astrbot_tool__ = name or fn.__name__
             return fn
         return deco
 
-    def on_llm_request(self):
+    def on_llm_request(self, **_kw):
         def deco(fn):
             fn.__astrbot_hook__ = "on_llm_request"
             return fn
@@ -199,10 +221,30 @@ logger = LOG
 
 class StarTools:
     @staticmethod
-    def get_data_dir(name: str) -> Path:
+    def get_data_dir(name: str = "") -> Path:
+        """Real AstrBot derives the plugin's data dir from the caller; most plugins
+        just call get_data_dir() with no argument."""
+        if not name:
+            import inspect as _inspect
+            for frame in _inspect.stack()[1:6]:
+                mod = frame.frame.f_globals.get("__name__", "")
+                if mod and mod not in ("star_host", "astrbot_plugin_under_test", "__main__") and "." in mod or mod.startswith("astrbot_plugin"):
+                    name = mod.split(".")[-1] if not mod.startswith("astrbot_plugin") else mod.split(".")[0]
+                    break
+        name = name or "default"
         p = Path.home() / ".dsh_compat_astrbot" / name
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+
+@dataclass
+class FunctionTool:
+    """Stand-in for astrbot.api.FunctionTool: plugins subclass it with @dataclass."""
+
+    name: str = ""
+    description: str = ""
+    parameters: dict = field(default_factory=dict)
+    handler: object = None
 
 
 class Plain:
@@ -263,14 +305,18 @@ class _StubModule(types.ModuleType):
         def _getattr(_self, item):
             raise AttributeError(item)
 
-        class _StubMeta(type):
-            # StarTools.get_data_dir(...) and friends: class-level use must not crash
-            def __getattr__(cls, item):
-                def _noop(*_a, **_k):
-                    return None
-                return _noop
+        def _call(_self, *a, **k):
+            if len(a) == 1 and not k and (inspect.isfunction(a[0]) or inspect.ismethod(a[0])):
+                return a[0]
+            return _self
 
-        stub = _StubMeta(name, (), {"__init__": _init, "__getattr__": _getattr})
+        class _StubMeta(type):
+            # StarTools.get_data_dir(...) and friends: class-level use must work
+            # both as a call and as an attribute chain (obj.method(...)).
+            def __getattr__(cls, item):
+                return _Permissive()
+
+        stub = _StubMeta(name, (), {"__init__": _init, "__getattr__": _getattr, "__call__": _call})
         setattr(self, name, stub)
         return stub
 
@@ -300,6 +346,7 @@ def _install_fake_astrbot() -> None:
     api = _StubModule("astrbot.api")
     api.logger = LOG
     api.StarTools = StarTools
+    api.FunctionTool = FunctionTool
 
     ev = _StubModule("astrbot.api.event")
     ev.AstrMessageEvent = AstrMessageEvent
@@ -344,6 +391,7 @@ def _install_fake_astrbot() -> None:
         "Star": Star,
         "StarTools": StarTools,
         "register": register,
+        "FunctionTool": FunctionTool,
     }
     for k, v in exported.items():
         setattr(allmod, k, v)
@@ -356,7 +404,14 @@ def _install_fake_astrbot() -> None:
     allmod.__all__ = list(exported) + extra
     api.all = allmod
 
-    for mod in (astrbot, api, ev, star, prov, comp, allmod):
+    core = _StubModule("astrbot.core")
+    core_star = _StubModule("astrbot.core.star")
+    core_tools = _StubModule("astrbot.core.star.star_tools")
+    core_tools.StarTools = StarTools
+    core_star.star_tools = core_tools
+    core.star = core_star
+
+    for mod in (astrbot, api, ev, star, prov, comp, allmod, core, core_star, core_tools):
         mod.__path__ = []          # make them packages, else astrbot.core fails
         sys.modules[mod.__name__] = mod
     if not any(isinstance(f, _AstrbotStubFinder) for f in sys.meta_path):
@@ -427,12 +482,10 @@ def load_plugin(plugin_dir: str, config: dict) -> Star:
     ctx = Context(config)
     for _, obj in vars(mod).items():
         if inspect.isclass(obj) and issubclass(obj, Star) and obj is not Star:
-            try:
-                if "config" in inspect.signature(obj.__init__).parameters:
-                    return obj(ctx, config)
-                return obj(ctx)
-            except TypeError:
-                return obj(ctx)
+            params = list(inspect.signature(obj.__init__).parameters)[1:]
+            if "config" in params:
+                return obj(ctx, config)
+            return obj(ctx)
     raise RuntimeError("main.py defines no Star subclass")
 
 
